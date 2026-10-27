@@ -77,8 +77,11 @@ def api_disk():
     return {"total": "?", "used": "?", "free": "?", "pct": "?"}
 
 def api_memory():
-    page_size = 16384
     vm = run("vm_stat")
+    # 16 KB on Apple Silicon, 4 KB on Intel — header: "(page size of 4096 bytes)"
+    import re
+    m_ps = re.search(r"page size of (\d+) bytes", vm)
+    page_size = int(m_ps.group(1)) if m_ps else 4096
     stats = {}
     for line in vm.splitlines():
         if ":" in line:
@@ -117,17 +120,23 @@ def api_memory():
     if m_used:  gpu_used  = int(m_used.group(1))
 
     # Top processes by RSS+CPU — ps aux: USER PID %CPU %MEM VSZ RSS TT STAT START TIME COMMAND
-    ps_out = run("ps aux 2>/dev/null | sort -rn -k6")
+    # comm = executable path only (no args); cpu may use comma decimals under pt-BR locale
+    ps_out = run("ps -axo pid=,%cpu=,rss=,comm= 2>/dev/null")
     skip = {"ps", "sort", "grep", "awk", "sed", "sh", "bash", "zsh", "launchd", "kernel_task"}
     groups = {}   # name → {rss_total, cpu_total, pids}
     for line in ps_out.splitlines():
-        parts = line.strip().split(None, 10)
-        if len(parts) < 11: continue
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4: continue
         try:
-            pid = int(parts[1]); cpu = float(parts[2].replace(",", ".")); rss = int(parts[5]) * 1024
+            pid = int(parts[0]); cpu = float(parts[1].replace(",", ".")); rss = int(parts[2]) * 1024
         except Exception: continue
-        raw  = parts[10].split("/")[-1]
-        name = raw.split(" Helper")[0].strip()
+        # some processes rewrite argv, so comm can carry args — drop them
+        exe = parts[3].split(" -")[0]
+        if ".app/" in exe:
+            # group helpers under their outermost app bundle (e.g. "Google Chrome")
+            name = exe.split(".app/")[0].split("/")[-1]
+        else:
+            name = exe.split("/")[-1].split(" Helper")[0].strip()
         if name in skip or rss < 5 * 1024 * 1024: continue
         if name not in groups:
             groups[name] = {"rss_total": 0, "cpu_total": 0.0, "pids": []}
@@ -348,6 +357,39 @@ def api_docker_prune():
     out = run("docker system prune -a --volumes -f 2>&1", timeout=300)
     return {"ok": True, "output": out}
 
+def _cpu_ticks():
+    import ctypes
+    lib = ctypes.CDLL("/usr/lib/libSystem.dylib")
+    lib.mach_host_self.restype = ctypes.c_uint
+    count = ctypes.c_uint()
+    info = ctypes.POINTER(ctypes.c_int)()
+    info_cnt = ctypes.c_uint()
+    PROCESSOR_CPU_LOAD_INFO = 2
+    lib.host_processor_info(lib.mach_host_self(), PROCESSOR_CPU_LOAD_INFO,
+                            ctypes.byref(count), ctypes.byref(info), ctypes.byref(info_cnt))
+    # 4 counters per core: user, system, idle, nice
+    ticks = [tuple(info[i * 4 + j] for j in range(4)) for i in range(count.value)]
+    task = ctypes.c_uint.in_dll(lib, "mach_task_self_")
+    lib.vm_deallocate(task, ctypes.cast(info, ctypes.c_void_p),
+                      ctypes.c_size_t(info_cnt.value * 4))
+    return ticks
+
+def api_cpu_cores():
+    a = _cpu_ticks()
+    _time.sleep(0.5)
+    b = _cpu_ticks()
+    # Apple Silicon lists efficiency cores first
+    e_cores = int(run("sysctl -n hw.perflevel1.logicalcpu 2>/dev/null") or 0)
+    cores = []
+    for i, (t0, t1) in enumerate(zip(a, b)):
+        user, system, idle, nice = (t1[k] - t0[k] for k in range(4))
+        total = user + system + idle + nice
+        busy = round((user + system + nice) / total * 100) if total else 0
+        kind = ("E" if i < e_cores else "P") if e_cores else ""
+        cores.append({"id": i, "kind": kind, "pct": busy})
+    avg = round(sum(c["pct"] for c in cores) / len(cores)) if cores else 0
+    return {"cores": cores, "avg": avg}
+
 def api_quick_heavies():
     dirs = [
         f"{HOME}/Downloads", f"{HOME}/Desktop", f"{HOME}/Movies",
@@ -521,6 +563,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(api_memory())
         elif path == "/api/quick-heavies":
             self.send_json(api_quick_heavies())
+        elif path == "/api/cpu-cores":
+            self.send_json(api_cpu_cores())
         elif path == "/api/log":
             self.send_json(list(reversed(_log)))
         else:
@@ -710,6 +754,14 @@ tr:hover td{background:var(--bg2)}
       <div style="font-size:11px;color:var(--text3)">serão liberados</div>
     </div>
     <button class="btn btn-danger" onclick="confirmReboot()"><i class="ti ti-refresh"></i> Reiniciar agora</button>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title"><i class="ti ti-cpu-2" aria-hidden="true"></i> CPU por núcleo <span id="cores-avg" style="color:var(--text3);font-weight:400"></span></span>
+      <button class="btn btn-sm" onclick="loadCores()"><i class="ti ti-refresh"></i> Atualizar</button>
+    </div>
+    <div id="cores-body" style="padding:14px"><div class="loading"><span class="spinner"></span>Medindo...</div></div>
   </div>
 
   <div class="card">
@@ -1037,6 +1089,7 @@ async function loadOverview() {
   bar.style.width = pct + '%';
   if (pct > 85) bar.classList.add('disk-warn');
   updateHealthAlerts(pct, d.free);
+  loadCores();
   loadMemory();
   loadTopFolders();
   loadQuickHeavies();
@@ -1087,6 +1140,25 @@ async function checkDockerAlert() {
       <button class="btn btn-sm btn-primary" onclick="nav(document.querySelector('[data-sec=docker]'))">Limpar Docker</button>
     </div>`;
   } catch(e) {}
+}
+
+async function loadCores() {
+  const d = await get('/api/cpu-cores');
+  document.getElementById('cores-avg').textContent = `· média ${d.avg}%`;
+  const hasKinds = d.cores.some(c => c.kind);
+  let h = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px 18px">';
+  d.cores.forEach(c => {
+    const color = c.pct > 80 ? 'var(--red)' : c.pct > 50 ? 'var(--amber)' : 'var(--blue)';
+    const label = hasKinds ? `${c.kind}${c.id}` : `#${c.id}`;
+    h += `<div style="display:flex;align-items:center;gap:8px;font-size:12px">
+      <span class="mono" style="width:28px">${label}</span>
+      <div style="flex:1;height:8px;background:var(--bg3);border-radius:4px;overflow:hidden"><div style="height:100%;width:${c.pct}%;background:${color}"></div></div>
+      <span style="width:34px;text-align:right;font-weight:600">${c.pct}%</span>
+    </div>`;
+  });
+  h += '</div>';
+  if (hasKinds) h += '<div class="notice" style="margin-top:8px">E = núcleos de eficiência · P = núcleos de desempenho</div>';
+  document.getElementById('cores-body').innerHTML = h;
 }
 
 async function loadQuickHeavies() {
